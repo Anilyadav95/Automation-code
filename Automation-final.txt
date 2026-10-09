@@ -1,0 +1,515 @@
+import boto3
+import csv
+import time
+from datetime import datetime, timedelta, timezone
+ 
+# ------------------------
+# AWS Clients
+# ------------------------
+ec2 = boto3.client("ec2")
+backup = boto3.client("backup")
+cloudwatch = boto3.client("cloudwatch")
+ssm = boto3.client("ssm")
+ 
+report = []
+ 
+ 
+# ---------------------------------------------------
+# EC2 Running Status
+# ---------------------------------------------------
+ 
+try:
+ 
+    reservations = ec2.describe_instances()["Reservations"]
+ 
+    for reservation in reservations:
+ 
+        for instance in reservation["Instances"]:
+ 
+            instance_name = "N/A"
+ 
+            for tag in instance.get("Tags", []):
+ 
+                if tag["Key"] == "Name":
+                    instance_name = tag["Value"]
+ 
+            private_ip = instance.get("PrivateIpAddress", "N/A")
+ 
+            report.append({
+ 
+                "Check": "Server Status",
+                "Resource": instance["InstanceId"],
+                "Status": "PASS" if instance["State"]["Name"] == "running" else "FAIL",
+                "Remarks": f"Name={instance_name} | State={instance['State']['Name']} | PrivateIP={private_ip}"
+ 
+            })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Server Status",
+        "Resource": "-",
+        "Status": "ERROR",
+        "Remarks": str(e)
+ 
+    })
+ 
+# ---------------------------------------------------
+# AWS Backup
+# ---------------------------------------------------
+ 
+try:
+ 
+    jobs = backup.list_backup_jobs(ByState="COMPLETED")["BackupJobs"]
+ 
+    if jobs:
+ 
+        latest = max(jobs, key=lambda x: x["CreationDate"])
+ 
+        report.append({
+ 
+            "Check": "AWS Backup",
+ 
+            "Resource": latest["ResourceArn"],
+ 
+            "Status": "PASS",
+ 
+            "Remarks": f"Latest Backup: {latest['CreationDate']}"
+ 
+        })
+ 
+    else:
+ 
+        report.append({
+ 
+            "Check": "AWS Backup",
+ 
+            "Resource": "-",
+ 
+            "Status": "FAIL",
+ 
+            "Remarks": "No Completed Backup Jobs"
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "AWS Backup",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+# ---------------------------------------------------
+# VPC Peering
+# ---------------------------------------------------
+ 
+try:
+ 
+    peerings = ec2.describe_vpc_peering_connections()["VpcPeeringConnections"]
+ 
+    for peer in peerings:
+ 
+        report.append({
+ 
+            "Check": "VPC Peering",
+ 
+            "Resource": peer["VpcPeeringConnectionId"],
+ 
+            "Status": "PASS" if peer["Status"]["Code"] == "active" else "FAIL",
+ 
+            "Remarks": peer["Status"]["Message"]
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "VPC Peering",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+ 
+# ---------------------------------------------------
+# Latest Snapshot Check
+# ---------------------------------------------------
+ 
+try:
+ 
+    snapshots = ec2.describe_snapshots(OwnerIds=["self"])["Snapshots"]
+ 
+    if snapshots:
+ 
+        latest = max(snapshots, key=lambda x: x["StartTime"])
+ 
+        age = datetime.now(timezone.utc) - latest["StartTime"]
+ 
+        report.append({
+ 
+            "Check": "Latest Snapshot",
+ 
+            "Resource": latest["SnapshotId"],
+ 
+            "Status": "PASS" if age.days < 1 else "FAIL",
+ 
+            "Remarks": f"Snapshot Age: {age.days} day(s)"
+ 
+        })
+ 
+    else:
+ 
+        report.append({
+ 
+            "Check": "Latest Snapshot",
+ 
+            "Resource": "-",
+ 
+            "Status": "FAIL",
+ 
+            "Remarks": "No Snapshots Found"
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Latest Snapshot",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+# ---------------------------------------------------
+# Unused Elastic IP
+# ---------------------------------------------------
+ 
+try:
+ 
+    addresses = ec2.describe_addresses()["Addresses"]
+ 
+    for ip in addresses:
+ 
+        report.append({
+ 
+            "Check": "Elastic IP",
+ 
+            "Resource": ip["PublicIp"],
+ 
+            "Status": "PASS" if "AssociationId" in ip else "FAIL",
+ 
+            "Remarks": "Attached" if "AssociationId" in ip else "Unused"
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Elastic IP",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+ 
+# ---------------------------------------------------
+# Resource Utilization (CPU, Memory, Disk)
+# ---------------------------------------------------
+ 
+try:
+ 
+    end = datetime.utcnow()
+    start = end - timedelta(minutes=30)
+ 
+    reservations = ec2.describe_instances()["Reservations"]
+ 
+    for reservation in reservations:
+ 
+        for instance in reservation["Instances"]:
+ 
+            # Skip stopped instances
+            if instance["State"]["Name"] != "running":
+                continue
+ 
+            instance_id = instance["InstanceId"]
+ 
+            # ---------------- CPU ----------------
+            cpu_metric = cloudwatch.get_metric_statistics(
+                Namespace="AWS/EC2",
+                MetricName="CPUUtilization",
+                Dimensions=[
+                    {
+                        "Name": "InstanceId",
+                        "Value": instance_id
+                    }
+                ],
+                StartTime=start,
+                EndTime=end,
+                Period=300,
+                Statistics=["Average"]
+            )
+ 
+            if cpu_metric["Datapoints"]:
+                latest = max(cpu_metric["Datapoints"], key=lambda x: x["Timestamp"])
+                cpu = latest["Average"]
+            else:
+                cpu = 0
+ 
+            # ---------------- Memory ----------------
+            mem_metric = cloudwatch.get_metric_statistics(
+                Namespace="CWAgent",
+                MetricName="mem_used_percent",
+                Dimensions=[
+                    {
+                        "Name": "InstanceId",
+                        "Value": instance_id
+                    }
+                ],
+                StartTime=start,
+                EndTime=end,
+                Period=300,
+                Statistics=["Average"]
+            )
+ 
+            if mem_metric["Datapoints"]:
+                latest = max(mem_metric["Datapoints"], key=lambda x: x["Timestamp"])
+                memory = latest["Average"]
+            else:
+                memory = 0
+ 
+            # ---------------- Disk ----------------
+            disk_metric = cloudwatch.get_metric_statistics(
+                Namespace="CWAgent",
+                MetricName="disk_used_percent",
+                Dimensions=[
+                    {
+                        "Name": "InstanceId",
+                        "Value": instance_id
+                    }
+                ],
+                StartTime=start,
+                EndTime=end,
+                Period=300,
+                Statistics=["Average"]
+            )
+ 
+            if disk_metric["Datapoints"]:
+                latest = max(disk_metric["Datapoints"], key=lambda x: x["Timestamp"])
+                disk = latest["Average"]
+            else:
+                disk = 0
+ 
+            status = "PASS"
+ 
+            if cpu >= 80 or memory >= 85 or disk >= 90:
+                status = "FAIL"
+ 
+            report.append({
+ 
+                "Check": "Resource Utilization",
+                "Resource": instance_id,
+                "Status": status,
+                "Remarks": f"CPU={cpu:.2f}% | Memory={memory:.2f}% | Disk={disk:.2f}%"
+ 
+            })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Resource Utilization",
+        "Resource": "-",
+        "Status": "ERROR",
+        "Remarks": str(e)
+ 
+    })
+ 
+ 
+# ---------------------------------------------------
+# Mount Points
+# ---------------------------------------------------
+ 
+try:
+ 
+    instances = ssm.describe_instance_information()["InstanceInformationList"]
+ 
+    for instance in instances:
+ 
+        response = ssm.send_command(
+ 
+            InstanceIds=[instance["InstanceId"]],
+ 
+            DocumentName="AWS-RunShellScript",
+ 
+            Parameters={
+ 
+                "commands": ["df -h"]
+ 
+            }
+ 
+        )
+ 
+        command_id = response["Command"]["CommandId"]
+ 
+        time.sleep(5)
+ 
+        output = ssm.get_command_invocation(
+ 
+            CommandId=command_id,
+ 
+            InstanceId=instance["InstanceId"]
+ 
+        )
+ 
+        report.append({
+ 
+            "Check": "Mount Points",
+ 
+            "Resource": instance["InstanceId"],
+ 
+            "Status": "PASS",
+ 
+            "Remarks": output["StandardOutputContent"].strip()
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Mount Points",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+ 
+# ---------------------------------------------------
+# Cron Jobs
+# ---------------------------------------------------
+ 
+try:
+ 
+    instances = ssm.describe_instance_information()["InstanceInformationList"]
+ 
+    for instance in instances:
+ 
+        response = ssm.send_command(
+ 
+            InstanceIds=[instance["InstanceId"]],
+ 
+            DocumentName="AWS-RunShellScript",
+ 
+            Parameters={
+ 
+                "commands": [
+ 
+                    "crontab -l 2>/dev/null || echo 'No cron jobs found'"
+ 
+                ]
+ 
+            }
+ 
+        )
+ 
+        command_id = response["Command"]["CommandId"]
+ 
+        time.sleep(5)
+ 
+        output = ssm.get_command_invocation(
+ 
+            CommandId=command_id,
+ 
+            InstanceId=instance["InstanceId"]
+ 
+        )
+ 
+        report.append({
+ 
+            "Check": "Cron Jobs",
+ 
+            "Resource": instance["InstanceId"],
+ 
+            "Status": "PASS",
+ 
+            "Remarks": output["StandardOutputContent"].strip()
+ 
+        })
+ 
+except Exception as e:
+ 
+    report.append({
+ 
+        "Check": "Cron Jobs",
+ 
+        "Resource": "-",
+ 
+        "Status": "ERROR",
+ 
+        "Remarks": str(e)
+ 
+    })
+ 
+# ---------------------------------------------------
+#
+# ---------------------------------------------------
+# CSV Report
+# ---------------------------------------------------
+ 
+filename = f"AWS_Health_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+ 
+with open(filename, "w", newline="") as file:
+ 
+    writer = csv.DictWriter(
+ 
+        file,
+ 
+        fieldnames=[
+ 
+            "Check",
+ 
+            "Resource",
+ 
+            "Status",
+ 
+            "Remarks"
+ 
+        ]
+ 
+    )
+ 
+    writer.writeheader()
+ 
+    writer.writerows(report)
+ 
+print("=" * 60)
+print("AWS Health Check Completed")
+print("Report :", filename)
+print("=" * 60)
